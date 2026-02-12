@@ -1,0 +1,9 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual environment
+venv/
+
+# Outputs / personal data
+arxiv_radar_weekly/
