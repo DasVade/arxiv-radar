@@ -3,8 +3,11 @@
 
 from __future__ import annotations
 
+import json
+import os
 import re
 import time
+from io import BytesIO
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -12,6 +15,7 @@ from typing import Dict, List, Tuple
 import arxiv
 import pandas as pd
 import requests
+from pypdf import PdfReader
 
 # =========================
 # CONFIG
@@ -32,6 +36,12 @@ MAX_RESULTS = 300
 SLEEP_SEC = 0.2
 
 MIN_HITS_ANY_BUCKET = 2
+
+OPENAI_MODEL = "gpt-4o-mini"
+OPENAI_TIMEOUT_SEC = 45
+OPENAI_API_KEY_FILE = Path.home() / ".arxiv_radar" / "openai_api_key.txt"
+PDF_TEXT_MAX_CHARS = 12000
+PDF_READ_MAX_PAGES = 6
 
 BUCKETS: Dict[str, List[str]] = {
     "P1_world_model_vla_3d": [
@@ -84,6 +94,102 @@ def ratio_counts(total, ratio):
     z = total - x - y
     return x, y, z
 
+
+
+def resolve_openai_key_file() -> Path:
+    env_key_file = os.getenv("OPENAI_API_KEY_FILE", "").strip()
+    if env_key_file:
+        return Path(env_key_file).expanduser()
+
+    appdata = os.getenv("APPDATA", "").strip()
+    if appdata:
+        return Path(appdata) / "arxiv-radar" / "openai_api_key.txt"
+
+    return OPENAI_API_KEY_FILE
+
+
+def load_openai_api_key() -> str:
+    env_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if env_key:
+        return env_key
+
+    key_file = resolve_openai_key_file()
+    if key_file.exists():
+        return key_file.read_text(encoding="utf-8").strip()
+
+    return ""
+
+def extract_pdf_text(pdf_url: str) -> str:
+    if not pdf_url:
+        return ""
+
+    try:
+        resp = requests.get(pdf_url, timeout=OPENAI_TIMEOUT_SEC)
+        resp.raise_for_status()
+        reader = PdfReader(BytesIO(resp.content))
+
+        chunks = []
+        for page in reader.pages[:PDF_READ_MAX_PAGES]:
+            page_text = (page.extract_text() or "").strip()
+            if page_text:
+                chunks.append(page_text)
+
+        text = "\n".join(chunks).strip()
+        return text[:PDF_TEXT_MAX_CHARS]
+    except Exception:
+        return ""
+
+
+def format_cn_overview(overview: str) -> str:
+    lines = [line.strip(" -•\t") for line in overview.splitlines() if line.strip()]
+    if not lines:
+        return "  - （中文文章概述生成失败）"
+    return "\n".join(f"  - {line}" for line in lines[:3])
+
+def build_chinese_digest(title: str, abstract: str, pdf_text: str) -> Tuple[str, str]:
+    api_key = load_openai_api_key()
+    if not api_key:
+        return "（未配置 OpenAI API Key，未生成中文摘要）", "（未配置 OpenAI API Key，未生成中文文章概述）"
+
+    url = "https://api.openai.com/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    prompt = (
+        "请你优先根据论文 PDF 正文内容生成结果；若 PDF 内容不足，再参考摘要。"
+        "输出一个 JSON 对象，包含两个字段："
+        "cn_summary（中文摘要，80~120字）和 cn_overview（中文文章概述，3个要点，每点一行，突出方法、结果和意义）。"
+        "仅输出 JSON，不要输出额外文字。"
+    )
+    payload = {
+        "model": OPENAI_MODEL,
+        "temperature": 0.2,
+        "messages": [
+            {"role": "system", "content": "你是一个严谨的科研助手。"},
+            {"role": "user", "content": f"标题：{title}\n\nPDF正文节选：{pdf_text or '（未成功读取PDF正文）'}\n\n摘要：{abstract}\n\n{prompt}"},
+        ],
+        "response_format": {"type": "json_object"},
+    }
+
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=OPENAI_TIMEOUT_SEC)
+        resp.raise_for_status()
+        content = resp.json()["choices"][0]["message"]["content"]
+        parsed = json.loads(content)
+        cn_summary = str(parsed.get("cn_summary", "")).strip()
+        cn_overview = str(parsed.get("cn_overview", "")).strip()
+        if not cn_summary:
+            cn_summary = "（中文摘要生成失败）"
+        if not cn_overview:
+            cn_overview = "（中文文章概述生成失败）"
+        return cn_summary, cn_overview
+    except Exception as e:
+        return (
+            f"（中文摘要生成失败：{e}）",
+            f"（中文文章概述生成失败：{e}）",
+        )
+
 # =========================
 # MAIN
 # =========================
@@ -101,6 +207,7 @@ def main():
     seen = load_seen()
 
     cat_query = " OR ".join([f"cat:{c}" for c in CATEGORIES])
+    client = arxiv.Client()
     search = arxiv.Search(
         query=f"({cat_query})",
         max_results=MAX_RESULTS,
@@ -110,7 +217,7 @@ def main():
 
     rows = []
 
-    for res in search.results():
+    for res in client.results(search):
         published = res.published.replace(tzinfo=timezone.utc)
         if published < since:
             continue
@@ -145,7 +252,8 @@ def main():
             "url": res.entry_id,
             "bucket": best_bucket,
             "score": best_score,
-            "abstract": abstract
+            "abstract": abstract,
+            "pdf_url": getattr(res, "pdf_url", "")
         })
 
         seen.add(pid)
@@ -170,10 +278,14 @@ def main():
     # Save Markdown
     md = [f"# Weekly Radar {today_str}\n"]
     for _, r in picks.iterrows():
+        pdf_text = extract_pdf_text(str(r.get("pdf_url", "")))
+        cn_summary, cn_overview = build_chinese_digest(r["title"], r["abstract"], pdf_text)
         md.append(f"- **[{r['pid']}]({r['url']})**  \n"
                   f"  {r['title']}  \n"
                   f"  *{r['authors']}*  \n"
-                  f"  _{r['abstract'][:300]}..._\n")
+                  f"  _{r['abstract'][:300]}..._\n"
+                  f"  **中文摘要：**{cn_summary}  \n"
+                  f"  **中文文章概述：**\n{format_cn_overview(cn_overview)}\n")
 
     MD_PATH.write_text("\n".join(md), encoding="utf-8")
 
@@ -195,4 +307,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
