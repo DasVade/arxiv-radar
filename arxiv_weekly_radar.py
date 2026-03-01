@@ -207,6 +207,7 @@ def main():
     seen = load_seen()
 
     cat_query = " OR ".join([f"cat:{c}" for c in CATEGORIES])
+    client = arxiv.Client()
     search = arxiv.Search(
         query=f"({cat_query})",
         max_results=MAX_RESULTS,
@@ -216,7 +217,7 @@ def main():
 
     rows = []
 
-    for res in search.results():
+    for res in client.results(search):
         published = res.published.replace(tzinfo=timezone.utc)
         if published < since:
             continue
