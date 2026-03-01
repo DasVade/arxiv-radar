@@ -28,7 +28,7 @@ DB_PATH = BASE_DIR / "arxiv_papers.csv"
 SEEN_PATH = BASE_DIR / "seen_ids.txt"
 
 DAYS_BACK = 7
-TOTAL_PICKS = 10
+TOTAL_PICKS = 20
 RATIO = (6, 3, 1)
 
 CATEGORIES = ["cs.CV", "cs.LG", "cs.RO", "cs.AI"]
@@ -47,8 +47,7 @@ BUCKETS: Dict[str, List[str]] = {
     "P1_world_model_vla_3d": [
         "world model", "embodied", "vla", "vision-language-action",
         "visuomotor", "policy learning", "sim2real",
-        "3d reconstruction", "multi-view", "structure from motion",
-        "slam", "nerf", "gaussian splatting", "robot", "robotics"
+        "3d reconstruction", "multi-view", "robot", "agent"
     ],
     "P2_generative_ai": [
         "diffusion", "generative model", "foundation model",
